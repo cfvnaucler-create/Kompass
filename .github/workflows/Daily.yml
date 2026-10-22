@@ -1,7 +1,7 @@
 name: Daglig simulering
 on:
 schedule:
-- cron: "30 22 * * 1-5" # vardagar 22:30 UTC, efter att börserna stängt
+- cron: 30 22 * * 1-5
 workflow_dispatch:
 permissions:
 contents: write
@@ -10,14 +10,7 @@ run:
 runs-on: ubuntu-latest
 steps:
 - uses: actions/checkout@v4
-- uses: actions/setup-python@v5
-        with:
-          python-version: 3.11
+- {uses: actions/setup-python@v5, with: {python-version: 3.11}}
 - run: pip install -r requirements.txt
 - run: python engine.py
-- name: Spara resultat
-run: |
-git config user.name "kompass-bot"
-git config user.email "bot@users.noreply.github.com"
-git add data/state.json docs/data.json
-git diff --staged --quiet || (git commit -m "Daglig körning" && git push)
+- run: git config user.name kompass-bot && git config user.email bot@users.noreply.github.com && git add data/state.json docs/data.json && (git diff --staged --quiet || (git commit -m daily && git push))
