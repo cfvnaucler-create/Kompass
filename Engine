@@ -1,0 +1,130 @@
+"""Kompass – daglig papperssimulering. Kör: python engine.py
+Inga riktiga pengar, inga mäklaranslutningar. Kurserna hämtas med yfinance."""
+import json, math
+from bisect import bisect_right
+from pathlib import Path
+import numpy as np
+import yfinance as yf
+
+START = 100_000
+FEE, STOP, MAXDD, MAXPOS, MINCASH = .001, .08, .15, .20, .20
+TICKERS = {"AAPL": "Apple", "MSFT": "Microsoft", "VOLV-B.ST": "Volvo B", "ERIC-B.ST": "Ericsson B",
+"SPY": "S&P 500 ETF", "GLD": "Guld ETF", "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum"}
+AGENTS = { # id: (namn, köpmotiv, säljmotiv)
+"mom": ("Momentum", "stark trend", "trend bruten"),
+"rev": ("Återgång", "RSI under 30", "RSI över 55"),
+"lov": ("Låg volatilitet", "låg risk, uppåttrend", "under 100-dagars trend"),
+"ben": ("Jämförelse", "jämn fördelning", "—"),
+}
+ROOT = Path(__file__).parent
+STATE, OUT = ROOT / "data" / "state.json", ROOT / "docs" / "data.json"
+
+
+def load_prices():
+raw = yf.download(list(TICKERS), period="6y", interval="1d", auto_adjust=True, progress=False)["Close"]
+raw = raw[raw["SPY"].notna()].ffill().dropna() # handelsdagar enligt börsen
+if len(raw) < 300:
+raise RuntimeError("För lite kursdata hämtades – avbryter utan att ändra något.")
+raw.index = raw.index.strftime("%Y-%m-%d")
+return raw[list(TICKERS)]
+
+
+def sma(a, i, n): return a[i - n + 1:i + 1].mean()
+def ret(a, i, n): return a[i] / a[i - n] - 1
+def vol(a, i, n): return (a[i - n + 1:i + 1] / a[i - n:i] - 1).std()
+def rsi(a, i, n=14):
+d = np.diff(a[i - n:i + 1]); g, l = d[d > 0].sum(), -d[d < 0].sum()
+return 100 if l == 0 else 100 - 100 / (1 + g / l)
+
+
+def targets(aid, C, i, pos):
+S = list(C)
+if aid == "mom":
+el = [s for s in S if C[s][i] > sma(C[s], i, 50) and sma(C[s], i, 20) > sma(C[s], i, 50) and ret(C[s], i, 60) > 0]
+el.sort(key=lambda s: -ret(C[s], i, 60))
+return {s: .16 for s in el[:5]}
+if aid == "rev":
+return {s: .15 for s in S if rsi(C[s], i) < 30 or (s in pos and rsi(C[s], i) < 55)}
+if aid == "lov":
+el = [s for s in S if C[s][i] > sma(C[s], i, 100)]
+iv = {s: 1 / vol(C[s], i, 60) for s in el}; tot = sum(iv.values())
+return {s: .7 * x / tot for s, x in iv.items()}
+return {s: .1 for s in S}
+
+
+def fresh(d):
+return {"cash": START, "pos": {}, "eq": [[d, START]], "peak": START, "halted": False, "log": []}
+
+
+def value(st, C, i): return st["cash"] + sum(q["n"] * C[s][i] for s, q in st["pos"].items())
+def kr(x): return f"{x:,.0f}".replace(",", " ") + " kr"
+
+
+def step(aid, st, C, i, d):
+_, enter, exit_ = AGENTS[aid]
+log = lambda s, m: st["log"].append({"d": d, "s": s, "m": m})
+eq = value(st, C, i); st["peak"] = max(st["peak"], eq)
+
+def sell(s, why):
+q = st["pos"].pop(s); v = q["n"] * C[s][i]; st["cash"] += v * (1 - FEE); log(s, f"SÄLJ {kr(v)} – {why}")
+
+if not st["halted"] and eq < st["peak"] * (1 - MAXDD):
+st["halted"] = True; log("–", "NÖDSTOPP: förlust över 15 % från toppen, allt säljs")
+for s in list(st["pos"]):
+if st["halted"]: sell(s, "nödstopp")
+elif C[s][i] < st["pos"][s]["e"] * (1 - STOP): sell(s, "stop-loss −8 %")
+if not st["halted"]:
+w = {s: min(x, MAXPOS) for s, x in targets(aid, C, i, st["pos"]).items()}
+tot = sum(w.values())
+if tot > 1 - MINCASH: w = {s: x * (1 - MINCASH) / tot for s, x in w.items()}
+eq = value(st, C, i)
+for s in list(st["pos"]):
+want, cur = w.get(s, 0) * eq, st["pos"][s]["n"] * C[s][i]
+if want < .005 * eq: sell(s, exit_)
+elif cur - want > .02 * eq:
+v = cur - want; st["pos"][s]["n"] -= v / C[s][i]; st["cash"] += v * (1 - FEE)
+log(s, f"JUSTERA NED {kr(v)} – riskgräns")
+for s, x in w.items():
+want = x * eq; cur = st["pos"][s]["n"] * C[s][i] if s in st["pos"] else 0
+if want - cur > .02 * eq:
+amt = min(want - cur, st["cash"] / (1 + FEE))
+if amt < .005 * eq: continue
+n = amt / C[s][i]; q = st["pos"].get(s, {"n": 0, "e": C[s][i]})
+q["e"] = (q["e"] * q["n"] + C[s][i] * n) / (q["n"] + n); q["n"] += n
+st["pos"][s] = q; st["cash"] -= amt * (1 + FEE); log(s, f"KÖP {kr(amt)} – {enter}")
+st["eq"].append([d, round(value(st, C, i), 2)])
+
+
+def metrics(eq):
+v = np.array([x[1] for x in eq]); r = v[1:] / v[:-1] - 1
+if len(r) < 2: return {"tot": 0, "sharpe": 0, "dd": 0}
+sd = r.std() or 1e-9
+return {"tot": v[-1] / v[0] - 1, "sharpe": r.mean() / sd * math.sqrt(252),
+"dd": (v / np.maximum.accumulate(v) - 1).min()}
+
+
+def main():
+df = load_prices(); dates = list(df.index); C = {s: df[s].values for s in df}
+state = json.loads(STATE.read_text()) if STATE.exists() else None
+if state is None:
+state = {"start": dates[-1], "last": dates[-1], "agents": {a: fresh(dates[-1]) for a in AGENTS}}
+live0 = bisect_right(dates, state["start"]) - 1
+bt = {}
+for a in AGENTS: # backtest på historiken före live-starten
+st = fresh(dates[100])
+for i in range(101, live0 + 1): step(a, st, C, i, dates[i])
+bt[a] = {"eq": st["eq"], **metrics(st["eq"])}
+for i in range(bisect_right(dates, state["last"]), len(dates)): # hämta ikapp missade dagar
+for a in AGENTS: step(a, state["agents"][a], C, i, dates[i])
+state["last"] = dates[i]
+live, last = {}, len(dates) - 1
+for a, st in state["agents"].items():
+st["log"] = st["log"][-300:]
+live[a] = {"cash": st["cash"], "halted": st["halted"], "eq": st["eq"], "log": st["log"][-100:],
+"pos": {s: {"value": q["n"] * C[s][last], "entry": q["e"]} for s, q in st["pos"].items()},
+**metrics(st["eq"])}
+out = {"updated": dates[-1], "start": state["start"], "names": {a: v[0] for a, v in AGENTS.items()},
+"assets": TICKERS, "backtest": bt, "live": live}
+STATE.parent.mkdir(exist_ok=True); OUT.parent.mkdir(exist_ok=True)
+STATE.write_text(json.dumps(state)); OUT.write_text(json.dumps(out, default=float))
+print("Klar. Senaste kursdag:", dates[-1])
